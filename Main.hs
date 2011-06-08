@@ -62,9 +62,9 @@ test_term :: Term
 --test_term = Let "x" (Value (Literal 5)) $ Case (Value (Data justDataCon ["x"])) [(nothingDataCon, [], Value (Literal 1)), (justDataCon, ["y"], Var "y")]
 -- FIXME below this line
 -- Simple function use. Does not need to reference closure:
-test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
+--test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
 -- Complex function use. Needs to reference closure:
---test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
+test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
 
 main :: IO ()
 main = do
@@ -319,7 +319,7 @@ termFreeVars worst_fvs e = term e
 
 
 restrict :: Ord k => M.Map k v -> S.Set k -> M.Map k v
-restrict m s = M.filterWithKey (\x _ -> x `S.notMember` s) m
+restrict m s = M.filterWithKey (\x _ -> x `S.member` s) m
 
 {-
 mapAccumLM :: (Monad m) => (acc -> x -> m (acc, y)) -> acc -> [x] -> m (acc, [y])
