@@ -50,11 +50,26 @@ test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
 main :: IO ()
 main = do
     initializeNativeTarget
-    f <- simpleFunction $ fmap snd $ runCompileM (compileTop test_term) (CE { symbolValues = M.empty }) ["float" ++ show i | i <- [1..]]
-    f
+    
+    let build_function = fmap snd $ runCompileM (compileTop test_term) (CE { symbolValues = M.empty }) ["float" ++ show i | i <- [1..]]
+    
+    m <- newModule
+    func <- defineModule m build_function
+    dumpValue func
+    
+    --f <- simpleFunction build_function
+    --f
+
+
+-- We use this type to represent values in our system that are *either*
+-- pointers to heap allocated closures/data *or* immediate Int32 values.
+--
+-- LLVM forbids void pointers, so we use the reccomended replacement:
+type VoidPtr = Ptr Int8
+
 
 data CompileEnv = CE {
-    symbolValues :: M.Map Var (Value (Ptr ()))
+    symbolValues :: M.Map Var (Value VoidPtr)
   }
 
 data CompileState = CS {
@@ -95,7 +110,7 @@ compileTop e = do
         _err <- call putchar (valueOf (fromIntegral (ord 'A')))
         ret ()
 
-compile :: Term -> CompileM (Function (IO (Ptr ())))
+compile :: Term -> CompileM (Function (IO VoidPtr))
 compile e = CM $ \env s -> tunnelIO (createFunction ExternalLinkage) $ compile' env s e (\s value_ptr -> fmap ((,) s) (ret value_ptr))
 
 tunnelIO :: (MonadIO m, MonadIO n)
@@ -127,8 +142,8 @@ tunnelIO2 control arg = do
     return (s, fun)
 
 compile' :: CompileEnv -> CompileState -> Term
-         -> (CompileState -> Value (Ptr ()) -> CodeGenFunction (Ptr ()) r)
-         -> CodeGenFunction (Ptr ()) r
+         -> (CompileState -> Value VoidPtr -> CodeGenFunction VoidPtr r)
+         -> CodeGenFunction VoidPtr r
 compile' env s (Var x) k = compileVar env x >>= k s
 compile' env s (Value v) k = case compileValue (M.keysSet (symbolValues env)) v of
     Immediate get_value_ptr -> get_value_ptr >>= k s
@@ -139,13 +154,13 @@ compile' env s (Value v) k = case compileValue (M.keysSet (symbolValues env)) v 
 compile' env s (App e x) k = compile' env s e $ \s closure_ptr -> do
     arg_ptr <- compileVar env x
     
-    fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction (Ptr ()) (Function (Ptr (Ptr () -> Ptr () -> IO (Ptr ()))))
+    fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Value (Ptr (Ptr (VoidPtr -> VoidPtr -> IO VoidPtr))))
     fun_ptr <- load fun_ptr_ptr
     
     call fun_ptr closure_ptr arg_ptr >>= k s
 compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
     -- Retrieve the tag:
-    tag_ptr <- bitcast data_ptr :: CodeGenFunction (Ptr ()) (Value (Ptr Int32))
+    tag_ptr <- bitcast data_ptr :: CodeGenFunction VoidPtr (Value (Ptr Int32))
     tag <- load tag_ptr
     
     -- Prepare the names of tail blocks, and the code that generates them
@@ -155,7 +170,7 @@ compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
         alt_block <- newBasicBlock
         let define_block s = do
               defineBasicBlock alt_block
-              field_base_ptr <- bitcast data_ptr :: CodeGenFunction (Ptr ()) (Value (Ptr (Ptr ())))
+              field_base_ptr <- bitcast data_ptr :: CodeGenFunction VoidPtr (Value (Ptr VoidPtr))
               env <- forAccumLM_ env (xs `zip` [1..]) $ \env (x, offset) -> do
                   field_ptr <- getElementPtr field_base_ptr (offset :: Int32, ())
                   value_ptr <- load field_ptr
@@ -187,41 +202,41 @@ compile' env s (LetRec xvs e_body) k = do
     -- We can predict the values each variable has before we actually intialize them. This is essential to tie the knot.
     (value_ptrs, pokes) <- fmap unzip $ forM get_value_ptrs_pokes $ \(x, get_value_ptr, mb_poke) -> do
         value_ptr <- get_value_ptr block_ptr
-        value_ptr' <- bitcast value_ptr :: CodeGenFunction (Ptr ()) (Value (Ptr ()))
-        return ((x, value_ptr'), \env s -> maybe (return s) (\poke -> poke env s value_ptr) mb_poke :: CodeGenFunction (Ptr ()) CompileState)
+        value_ptr' <- bitcast value_ptr :: CodeGenFunction VoidPtr (Value VoidPtr)
+        return ((x, value_ptr'), \env s -> maybe (return s) (\poke -> poke env s value_ptr) mb_poke :: CodeGenFunction VoidPtr CompileState)
     
     -- Create the extended environment with the new predictions, and actually initialize the values by using that environment
     let env' = env { symbolValues = M.fromList value_ptrs `M.union` symbolValues env }
     s <- forAccumLM_ s pokes (\s poke -> poke env' s)
     
     compile' env' s e_body k
-compile' env s (PrimOp pop es) k = cpsBindN [TH (\s (k :: CompileState -> Value Int32 -> m r) -> compile' env s e (\s value_ptr -> bitcast value_ptr >>= k s)) | e <- es] s $ \s arg_ints -> do
+compile' env s (PrimOp pop es) k = cpsBindN [TH (\s (k :: CompileState -> Value Int32 -> m r) -> compile' env s e (\s value_ptr -> ptrtoint value_ptr >>= k s)) | e <- es] s $ \s arg_ints -> do
     res_int <- case (pop, arg_ints) of
         (Add,      [i1, i2]) -> add i1 i2
         (Subtract, [i1, i2]) -> sub i1 i2
         (Multiply, [i1, i2]) -> mul i1 i2
         _ -> error "Bad primitive operation arity"
-    bitcast res_int >>= k s
+    inttoptr res_int >>= k s
 compile' env s (Weaken x e) k = compile' (env { symbolValues = M.delete x (symbolValues env) }) s e k
 compile' env s (Delay e) k = error "TODO: unimplemented"
 
-compileVar :: CompileEnv -> Var -> CodeGenFunction (Ptr ()) (Value (Ptr ()))
+compileVar :: CompileEnv -> Var -> CodeGenFunction VoidPtr (Value VoidPtr)
 compileVar env x = case M.lookup x (symbolValues env) of
     Nothing        -> error $ "Unbound variable " ++ show x
     Just value_ptr -> return value_ptr
 
-data ValueBuilder = Immediate (CodeGenFunction (Ptr ()) (Value (Ptr ())))
-                  | HeapAllocated Word32 (CompileEnv -> CompileState -> Value (Ptr (Ptr ())) -> CodeGenFunction (Ptr ()) CompileState)
+data ValueBuilder = Immediate (CodeGenFunction VoidPtr (Value VoidPtr))
+                  | HeapAllocated Word32 (CompileEnv -> CompileState -> Value (Ptr VoidPtr) -> CodeGenFunction VoidPtr CompileState)
 
 compileValue :: S.Set Var -> Val -> ValueBuilder
 compileValue avails v = case v of
     -- Do not allocate space: we will pack Int32s into pointers
     -- NB: this code assumes Int32s fit into pointers! Probably safe, but...
-    Literal l  -> Immediate $ bitcast (valueOf l)
+    Literal l  -> Immediate $ inttoptr (valueOf l)
     -- Allocate space for one pointer per data item, and one pointer for the tag
     Data dc xs -> HeapAllocated (1 + genericLength xs) $ \env s data_ptr -> do
         -- Poke in the tag
-        tag_ptr <- bitcast data_ptr :: CodeGenFunction (Ptr ()) (Value (Ptr Int32))
+        tag_ptr <- bitcast data_ptr :: CodeGenFunction VoidPtr (Value (Ptr Int32))
         store (valueOf (dataConTag dc)) tag_ptr
     
         -- Poke in the data
@@ -241,7 +256,7 @@ compileValue avails v = case v of
                                                                                      in ((offset, value_ptr), (x, get_value_ptr))
         
         -- Poke in the code
-        fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction (Ptr ()) (Function (Ptr (Ptr () -> Ptr () -> IO (Ptr ()))))
+        fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Function (Ptr (VoidPtr -> VoidPtr -> IO VoidPtr)))
         fun_ptr <- externFunction name
         store fun_ptr fun_ptr_ptr
         
@@ -251,7 +266,7 @@ compileValue avails v = case v of
             store value_ptr field_ptr
         
         -- Pend the definition of the code for function referened by that closure
-        let define_function s = fmap (\(s, fun_ptr :: Function (Ptr (Ptr ()) -> Ptr () -> IO (Ptr ()))) -> s) $ tunnelIO2 (createNamedFunction ExternalLinkage name) $ \closure_ptr arg_ptr -> do
+        let define_function s = fmap (\(s, fun_ptr :: Function (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)) -> s) $ tunnelIO2 (createNamedFunction ExternalLinkage name) $ \closure_ptr arg_ptr -> do
                 closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
                 compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
         return (s { functionNameSupply = names, pendingFunctions = define_function : pendingFunctions s })
