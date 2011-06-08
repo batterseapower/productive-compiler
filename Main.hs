@@ -70,7 +70,7 @@ main :: IO ()
 main = do
     initializeNativeTarget
     
-    let build_function = fmap snd $ runCompileM (compileTop test_term) (CE { symbolValues = M.empty }) ["float" ++ show (i :: Integer) | i <- [1..]]
+    let build_function = runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
     
     -- Use C API to build a LLVM Module containing our code
     m <- newModule
@@ -100,22 +100,12 @@ data CompileEnv = CE {
     symbolValues :: M.Map Var (Value VoidPtr)
   }
 
-data CompileState = CS {
-    pendingFunctions :: [CompileState -> CodeGenModule CompileState],
-    functionNameSupply :: [String]
-  }
+type CompileState = ()
 
 newtype CompileM a = CM { unCM :: CompileEnv -> CompileState -> CodeGenModule (CompileState, a) }
 
-runCompileM :: CompileM a -> CompileEnv -> [String] -> CodeGenModule ([String], a)
-runCompileM cm env names = do
-    (s, x) <- unCM cm env (CS { pendingFunctions = [], functionNameSupply = names })
-    names <- discharge_pending s
-    return (names, x)
-  where
-    discharge_pending s = case pendingFunctions s of
-      []       -> return (functionNameSupply s)
-      (cf:cfs) -> cf (s { pendingFunctions = cfs }) >>= discharge_pending
+runCompileM :: CompileM a -> CompileEnv -> CodeGenModule a
+runCompileM cm env = fmap snd (unCM cm env ())
 
 instance Functor CompileM where
     fmap = liftM
@@ -134,7 +124,7 @@ compileTop e = do
     --printf <- liftCGM (newNamedFunction ExternalLinkage "printf" :: TFunction (Ptr Int8 -> VarArgs Int32))
     --format_string <- liftCGM (createStringNul "%d")
     
-    liftCGM $ createFunction ExternalLinkage $ do
+    liftCGM $ createFunction InternalLinkage $ do
         -- For simplicity, we're going to assume that the code always returns an immediate integer
         value <- call work >>= ptrtoint :: CodeGenFunction Int32 (Value Int32)
         ret value :: CodeGenFunction Int32 Terminate
@@ -143,7 +133,7 @@ compileTop e = do
         --ret ()
 
 compile :: Term -> CompileM (Function (IO VoidPtr))
-compile e = CM $ \env s -> tunnelIO (createFunction ExternalLinkage) $ compile' env s e (\s value_ptr -> fmap ((,) s) (ret value_ptr))
+compile e = CM $ \env s -> tunnelIO (createFunction InternalLinkage) $ compile' env s e (\s value_ptr -> fmap ((,) s) (ret value_ptr))
 
 tunnelIO :: (MonadIO m, MonadIO n)
          => (m a -> n b)
@@ -281,16 +271,19 @@ compileValue avails v = case v of
         return s
     -- Allocate space for one pointer per closure variable, and one pointer for the code
     Lambda x e -> HeapAllocated (1 + fromIntegral (S.size avails_used)) $ \env s closure_ptr -> do
-        let (name:names) = functionNameSupply s
-            (closed_value_ptrs, get_closure_value_ptrs) = unzip $ flip map ([1..] `zip` M.toList (symbolValues env `restrict` avails_used)) $
+        let (closed_value_ptrs, get_closure_value_ptrs) = unzip $ flip map ([1..] `zip` M.toList (symbolValues env `restrict` avails_used)) $
                                                         \(offset, (x, value_ptr)) -> let get_value_ptr closure_ptr = do
                                                                                             field_ptr <- getElementPtr closure_ptr (offset :: Int32, ())
                                                                                             load field_ptr
                                                                                      in ((offset, value_ptr), (x, get_value_ptr))
         
+        -- Define the function corresponding to the lambda body
+        (s, fun_ptr) <- liftCodeGenModule $ tunnelIO2 (createFunction InternalLinkage) $ \closure_ptr arg_ptr -> do
+            closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
+            compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
+        
         -- Poke in the code
         fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Function (Ptr (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)))
-        fun_ptr <- externFunction name
         store fun_ptr fun_ptr_ptr
         
         -- Poke in the closure variables
@@ -298,11 +291,7 @@ compileValue avails v = case v of
             field_ptr <- getElementPtr closure_ptr (offset, ())
             store value_ptr field_ptr
         
-        -- Pend the definition of the code for function referened by that closure
-        let define_function s = fmap (\(s, _fun_ptr :: Function (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)) -> s) $ tunnelIO2 (createNamedFunction ExternalLinkage name) $ \closure_ptr arg_ptr -> do
-                closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
-                compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
-        return (s { functionNameSupply = names, pendingFunctions = define_function : pendingFunctions s })
+        return s
       where avails_used = S.delete x (termFreeVars avails e)
 
 
