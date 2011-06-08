@@ -13,6 +13,8 @@ import Data.IORef
 import qualified Data.Map as M
 import qualified Data.Set as S
 
+import System.IO (fixIO)
+
 import Foreign.Ptr
 
 import LLVM.Core
@@ -64,7 +66,9 @@ test_term :: Term
 -- Simple function use. Does not need to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
 -- Complex function use. Needs to reference closure:
-test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
+--test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
+-- Trivial delay
+test_term = Delay (Value (Literal 1))
 
 main :: IO ()
 main = do
@@ -72,7 +76,7 @@ main = do
     
     let build_function = runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
     
-    -- Use C API to build a LLVM Module containing our code
+    -- Build a LLVM Module containing our code
     m <- newModule
     (func_value, mappings) <- defineModule m (liftM2 (,) build_function getGlobalMappings)
     writeBitcodeToFile "output.bc" m
@@ -133,33 +137,31 @@ compileTop e = do
         --ret ()
 
 compile :: Term -> CompileM (Function (IO VoidPtr))
-compile e = CM $ \env s -> tunnelIO (createFunction InternalLinkage) $ compile' env s e (\s value_ptr -> fmap ((,) s) (ret value_ptr))
+compile e = CM $ \env s -> tunnelIO (createFunction InternalLinkage) $ compile' env s e (\s value_ptr -> fmap (const s) (ret value_ptr))
 
 tunnelIO :: (MonadIO m, MonadIO n)
-         => (m a -> n b)
-         -> m (c, a)
+         => (m () -> n b)
+         -> m c
          -> n (c, b)
 tunnelIO control arg = do
     -- Urgh, have to resort to tunneling through IORef to get the new State out
     s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
     fun <- control $ do
-        (s, res) <- arg
+        s <- arg
         liftIO $ writeIORef s_ref s
-        return res
     s <- liftIO $ readIORef s_ref
     return (s, fun)
 
 tunnelIO2 :: (MonadIO m, MonadIO n)
-          => ((arg1 -> arg2 -> m a) -> n b)
-          -> (arg1 -> arg2 -> m (c, a))
+          => ((arg1 -> arg2 -> m ()) -> n b)
+          -> (arg1 -> arg2 -> m c)
           -> n (c, b)
 tunnelIO2 control arg = do
     -- Urgh, have to resort to tunneling through IORef to get the new State out
     s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
     fun <- control $ \arg1 arg2 -> do
-        (s, res) <- arg arg1 arg2
+        s <- arg arg1 arg2
         liftIO $ writeIORef s_ref s
-        return res
     s <- liftIO $ readIORef s_ref
     return (s, fun)
 
@@ -241,7 +243,48 @@ compile' env s (PrimOp pop es) k = cpsBindN [TH (\s (k :: CompileState -> Value 
         _ -> error "Bad primitive operation arity"
     inttoptr res_int >>= k s
 compile' env s (Weaken x e) k = compile' (env { symbolValues = M.delete x (symbolValues env) }) s e k
-compile' env s (Delay e) k = error "TODO: unimplemented" env s e k
+compile' env s (Delay e) k = do
+    -- Create a block of memory we can use to marshal our lexical environment around
+    block_ptr <- arrayAlloca (fromIntegral (M.size (symbolValues env)) :: Word32) :: CodeGenFunction VoidPtr (Value (Ptr VoidPtr))
+    get_block_value_ptrs <- forM ([0..] `zip` M.toList (symbolValues env)) $ \(offset, (x, value_ptr)) -> do
+        field_ptr <- getElementPtr block_ptr (offset :: Int32, ())
+        store value_ptr field_ptr
+        return $ \block_ptr -> do
+            field_ptr <- getElementPtr block_ptr (offset, ())
+            fmap ((,) x) $ load field_ptr
+    
+    -- We transfer control to the function pointer stored in the global with this name
+    let trampoline_global_name = "foo_name" -- FIXME: fresh name
+    
+    -- Create Haskell trampoline that will be invoked when we first need to compile this
+    reenter_compiler_ptr <- liftIO $ fixIO $ \reenter_compiler_ptr -> wrapDelay $ \block_ptr -> do
+        -- Build a Module containing the replacement code and fixup code that transfers
+        -- control to the replacement code right now
+        fixup_func <- simpleFunction $ do
+            replacement_func_value <- createFunction InternalLinkage $ \(block_ptr :: Value (Ptr VoidPtr)) -> do
+                -- FIXME: in the future I may need a different CompileState here
+                value_ptrs <- mapM ($ block_ptr) get_block_value_ptrs
+                _s <- compile' (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr)) :: CodeGenFunction VoidPtr CompileState
+                return ()
+            
+            trampoline_global <- newNamedGlobal False ExternalLinkage trampoline_global_name :: CodeGenModule (Global (Ptr (Ptr VoidPtr -> IO VoidPtr)))
+            createFunction InternalLinkage $ \block_ptr -> do
+                -- Make sure that next time we execute this Delay we jump right to the replacement
+                store replacement_func_value trampoline_global
+                -- Call the replacement code right now to get the work done
+                call replacement_func_value block_ptr >>= ret
+        
+        -- Do the fixup
+        freeHaskellFunPtr reenter_compiler_ptr -- TODO: I probably shouldn't free this function while it is still running!
+        fixup_func block_ptr
+    
+    -- Transfer control
+    trampoline_global <- liftCodeGenModule $ createNamedGlobal False ExternalLinkage trampoline_global_name (constOf (castFunPtrToPtr reenter_compiler_ptr))
+    trampoline_ptr <- load trampoline_global
+    call trampoline_ptr block_ptr >>= k s
+
+foreign import ccall "wrapper"
+    wrapDelay :: (Ptr VoidPtr -> IO VoidPtr) -> IO (FunPtr (Ptr VoidPtr -> IO VoidPtr))
 
 compileVar :: CompileEnv -> Var -> CodeGenFunction VoidPtr (Value VoidPtr)
 compileVar env x = case M.lookup x (symbolValues env) of
@@ -280,7 +323,7 @@ compileValue avails v = case v of
         -- Define the function corresponding to the lambda body
         (s, fun_ptr) <- liftCodeGenModule $ tunnelIO2 (createFunction InternalLinkage) $ \closure_ptr arg_ptr -> do
             closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
-            compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
+            compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap (const s) (ret value_ptr)
         
         -- Poke in the code
         fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Function (Ptr (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)))
