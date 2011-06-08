@@ -25,6 +25,14 @@ type Literal = Int32
 
 data DataCon = DC { dataConName :: String, dataConTag :: Int32 }
 
+trueDataCon, falseDataCon :: DataCon
+falseDataCon = DC "False" 0
+trueDataCon = DC "True" 1
+
+nothingDataCon, justDataCon :: DataCon
+nothingDataCon = DC "Nothing" 0
+justDataCon = DC "Just" 1
+
 data PrimOp = Add | Subtract | Multiply
 
 -- A strict functional language
@@ -44,9 +52,19 @@ data Val = Lambda Var Term
 
 
 test_term :: Term
+-- Simple arithmetic:
 --test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
-test_term = Let "x" (Value (Literal 1)) (Value (Literal 2))
+-- Test that exposed "let" miscompilation:
+--test_term = Let "x" (Value (Literal 1)) (Value (Literal 2))
+-- Simple case branches:
+--test_term = Case (Value (Data trueDataCon [])) [(trueDataCon, [], Value (Literal 1)), (falseDataCon, [], Value (Literal 2))]
+-- Complex case branches:
+test_term = Let "x" (Value (Literal 5)) $ Case (Value (Data justDataCon ["x"])) [(nothingDataCon, [], Value (Literal 1)), (justDataCon, ["y"], Var "y")]
+-- FIXME below this line
+-- Simple function use. Does not need to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
+-- Complex function use. Needs to reference closure:
+--test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
 
 main :: IO ()
 main = do
