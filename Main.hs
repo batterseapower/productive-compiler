@@ -59,10 +59,10 @@ test_term :: Term
 -- Simple case branches:
 --test_term = Case (Value (Data trueDataCon [])) [(trueDataCon, [], Value (Literal 1)), (falseDataCon, [], Value (Literal 2))]
 -- Complex case branches:
-test_term = Let "x" (Value (Literal 5)) $ Case (Value (Data justDataCon ["x"])) [(nothingDataCon, [], Value (Literal 1)), (justDataCon, ["y"], Var "y")]
+--test_term = Let "x" (Value (Literal 5)) $ Case (Value (Data justDataCon ["x"])) [(nothingDataCon, [], Value (Literal 1)), (justDataCon, ["y"], Var "y")]
 -- FIXME below this line
 -- Simple function use. Does not need to reference closure:
---test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
+test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
 -- Complex function use. Needs to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
 
@@ -289,7 +289,7 @@ compileValue avails v = case v of
                                                                                      in ((offset, value_ptr), (x, get_value_ptr))
         
         -- Poke in the code
-        fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Function (Ptr (VoidPtr -> VoidPtr -> IO VoidPtr)))
+        fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Function (Ptr (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)))
         fun_ptr <- externFunction name
         store fun_ptr fun_ptr_ptr
         
