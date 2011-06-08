@@ -1,0 +1,11 @@
+# OS Junk
+.DS_Store
+Thumbs.db
+
+# Generated files
+dist/
+*.hi
+*.o
+
+# Other build artifacts
+Main
