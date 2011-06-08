@@ -1,10 +1,10 @@
 {-# LANGUAGE Rank2Types, ScopedTypeVariables #-}
+{-# OPTIONS_GHC -Wall -fno-warn-name-shadowing #-}
 module Main (main) where
 
 import Control.Monad
 import Control.Monad.IO.Class
 
-import Data.Char
 import Data.Int
 import Data.Word
 import Data.List
@@ -44,14 +44,15 @@ data Val = Lambda Var Term
 
 
 test_term :: Term
---test_term = Value (Lambda "x" (Var "x"))
-test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
+--test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
+test_term = Let "x" (Value (Literal 1)) (Value (Literal 2))
+--test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
 
 main :: IO ()
 main = do
     initializeNativeTarget
     
-    let build_function = fmap snd $ runCompileM (compileTop test_term) (CE { symbolValues = M.empty }) ["float" ++ show i | i <- [1..]]
+    let build_function = fmap snd $ runCompileM (compileTop test_term) (CE { symbolValues = M.empty }) ["float" ++ show (i :: Integer) | i <- [1..]]
     
     -- Use C API to build a LLVM Module containing our code
     m <- newModule
@@ -203,7 +204,7 @@ compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
     defineBasicBlock join_block
     phi phi_data >>= k s
 compile' env s (Let x e_bound e_body) k = compile' env s e_bound $ \s bound_ptr -> do
-    compile' (env { symbolValues = M.insert x bound_ptr (symbolValues env) }) s e_bound k
+    compile' (env { symbolValues = M.insert x bound_ptr (symbolValues env) }) s e_body k
 compile' env s (LetRec xvs e_body) k = do
     -- Decide how each value will be allocated
     let avails = S.fromList (map fst xvs) `S.union` M.keysSet (symbolValues env)
@@ -232,7 +233,7 @@ compile' env s (PrimOp pop es) k = cpsBindN [TH (\s (k :: CompileState -> Value 
         _ -> error "Bad primitive operation arity"
     inttoptr res_int >>= k s
 compile' env s (Weaken x e) k = compile' (env { symbolValues = M.delete x (symbolValues env) }) s e k
-compile' env s (Delay e) k = error "TODO: unimplemented"
+compile' env s (Delay e) k = error "TODO: unimplemented" env s e k
 
 compileVar :: CompileEnv -> Var -> CodeGenFunction VoidPtr (Value VoidPtr)
 compileVar env x = case M.lookup x (symbolValues env) of
@@ -254,7 +255,7 @@ compileValue avails v = case v of
         store (valueOf (dataConTag dc)) tag_ptr
     
         -- Poke in the data
-        forM (xs `zip` [1..]) $ \(x, offset) -> do
+        forM_ (xs `zip` [1..]) $ \(x, offset) -> do
             field_ptr <- getElementPtr data_ptr (offset :: Int32, ())
             value_ptr <- compileVar env x
             store value_ptr field_ptr
@@ -275,12 +276,12 @@ compileValue avails v = case v of
         store fun_ptr fun_ptr_ptr
         
         -- Poke in the closure variables
-        forM closed_value_ptrs $ \(offset, value_ptr) -> do
+        forM_ closed_value_ptrs $ \(offset, value_ptr) -> do
             field_ptr <- getElementPtr closure_ptr (offset, ())
             store value_ptr field_ptr
         
         -- Pend the definition of the code for function referened by that closure
-        let define_function s = fmap (\(s, fun_ptr :: Function (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)) -> s) $ tunnelIO2 (createNamedFunction ExternalLinkage name) $ \closure_ptr arg_ptr -> do
+        let define_function s = fmap (\(s, _fun_ptr :: Function (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)) -> s) $ tunnelIO2 (createNamedFunction ExternalLinkage name) $ \closure_ptr arg_ptr -> do
                 closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
                 compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
         return (s { functionNameSupply = names, pendingFunctions = define_function : pendingFunctions s })
@@ -302,7 +303,7 @@ termFreeVars worst_fvs e = term e
       Let x e1 e2 -> term e1 `S.union` S.delete x (term e2)
       PrimOp _ es -> S.unions (map term es)
       Weaken x e -> S.delete x (term e)
-      Delay e -> worst_fvs
+      Delay _ -> worst_fvs
     
     value v = case v of
       Lambda x e -> S.delete x (term e)
@@ -313,12 +314,14 @@ termFreeVars worst_fvs e = term e
 restrict :: Ord k => M.Map k v -> S.Set k -> M.Map k v
 restrict m s = M.filterWithKey (\x _ -> x `S.notMember` s) m
 
+{-
 mapAccumLM :: (Monad m) => (acc -> x -> m (acc, y)) -> acc -> [x] -> m (acc, [y])
 mapAccumLM _ s []     = return (s, [])
 mapAccumLM f s (x:xs) = do
      (s', y)  <- f s x
      (s'',ys) <- mapAccumLM f s' xs
      return (s'',y:ys)
+-}
 
 accumLM :: (Monad m) => acc -> [acc -> m (acc, y)] -> m (acc, [y])
 accumLM s []     = return (s, [])
