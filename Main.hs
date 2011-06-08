@@ -53,12 +53,21 @@ main = do
     
     let build_function = fmap snd $ runCompileM (compileTop test_term) (CE { symbolValues = M.empty }) ["float" ++ show i | i <- [1..]]
     
+    -- Use C API to build a LLVM Module containing our code
     m <- newModule
-    func <- defineModule m build_function
-    dumpValue func
+    (func_value, mappings) <- defineModule m (liftM2 (,) build_function getGlobalMappings)
+    writeBitcodeToFile "output.bc" m
     
-    --f <- simpleFunction build_function
-    --f
+    -- JIT-compile our code
+    prov <- createModuleProviderForExistingModule m
+    func <- runEngineAccess $ do
+        addModuleProvider prov
+        addGlobalMappings mappings
+        generateFunction func_value
+    
+    -- Run the compiled code
+    putStrLn "Here we go:"
+    func >>= print
 
 
 -- We use this type to represent values in our system that are *either*
@@ -100,15 +109,19 @@ liftCGM :: CodeGenModule a -> CompileM a
 liftCGM cgm = CM $ \_ s -> fmap ((,) s) cgm
 
 
-compileTop :: Term -> CompileM (Function (IO ()))
+compileTop :: Term -> CompileM (Function (IO Int32))
 compileTop e = do
     work <- compile e
-    putchar <- liftCGM (newNamedFunction ExternalLinkage "putchar" :: TFunction (Int32 -> IO Int32))
+    --printf <- liftCGM (newNamedFunction ExternalLinkage "printf" :: TFunction (Ptr Int8 -> VarArgs Int32))
+    --format_string <- liftCGM (createStringNul "%d")
     
     liftCGM $ createFunction ExternalLinkage $ do
-        _ptr <- call work
-        _err <- call putchar (valueOf (fromIntegral (ord 'A')))
-        ret ()
+        -- For simplicity, we're going to assume that the code always returns an immediate integer
+        value <- call work >>= ptrtoint :: CodeGenFunction Int32 (Value Int32)
+        ret value :: CodeGenFunction Int32 Terminate
+        
+        --_nchars <- call printf format_string value
+        --ret ()
 
 compile :: Term -> CompileM (Function (IO VoidPtr))
 compile e = CM $ \env s -> tunnelIO (createFunction ExternalLinkage) $ compile' env s e (\s value_ptr -> fmap ((,) s) (ret value_ptr))
@@ -157,6 +170,7 @@ compile' env s (App e x) k = compile' env s e $ \s closure_ptr -> do
     fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Value (Ptr (Ptr (VoidPtr -> VoidPtr -> IO VoidPtr))))
     fun_ptr <- load fun_ptr_ptr
     
+    -- TODO: do I need to mark this as a tail call?
     call fun_ptr closure_ptr arg_ptr >>= k s
 compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
     -- Retrieve the tag:
