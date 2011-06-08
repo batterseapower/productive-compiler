@@ -42,6 +42,7 @@ data Val = Lambda Var Term
          | Data DataCon [Var]
          | Literal Literal
 
+
 test_term :: Term
 --test_term = Value (Lambda "x" (Var "x"))
 test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
@@ -231,9 +232,9 @@ compileValue avails v = case v of
     
         return s
     -- Allocate space for one pointer per closure variable, and one pointer for the code
-    Lambda x e -> HeapAllocated (1 + fromIntegral (S.size avails)) $ \env s closure_ptr -> do
+    Lambda x e -> HeapAllocated (1 + fromIntegral (S.size avails_used)) $ \env s closure_ptr -> do
         let (name:names) = functionNameSupply s
-            (closed_value_ptrs, get_closure_value_ptrs) = unzip $ flip map ([1..] `zip` M.toList (symbolValues env)) $
+            (closed_value_ptrs, get_closure_value_ptrs) = unzip $ flip map ([1..] `zip` M.toList (symbolValues env `restrict` avails_used)) $
                                                         \(offset, (x, value_ptr)) -> let get_value_ptr closure_ptr = do
                                                                                             field_ptr <- getElementPtr closure_ptr (offset :: Int32, ())
                                                                                             load field_ptr
@@ -254,13 +255,34 @@ compileValue avails v = case v of
                 closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
                 compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
         return (s { functionNameSupply = names, pendingFunctions = define_function : pendingFunctions s })
+      where avails_used = S.delete x (termFreeVars avails e)
 
 
--- TODO: use this to trim closure size
--- termFreeVars :: Term -> S.Set Var -> S.Set Var
--- termFreeVars (Var x) _ = S.singleton x
--- termFreeVars 
+-- This is a proof-of-concept function used to show that (thanks to Weaken) we can still do the
+-- useful optimisation of closing over only those things that may be touched in the future.
+termFreeVars :: S.Set Var -> Term -> S.Set Var
+termFreeVars worst_fvs e = term e
+  where
+    term e = case e of
+      Var x -> S.singleton x
+      Value v -> value v
+      App e x -> S.insert x (term e)
+      Case e alts -> term e `S.union` S.unions [term e S.\\ S.fromList xs | (_, xs, e) <- alts]
+      LetRec xvs e -> (term e `S.union` S.unions (map value vs)) S.\\ S.fromList xs
+        where (xs, vs) = unzip xvs
+      Let x e1 e2 -> term e1 `S.union` S.delete x (term e2)
+      PrimOp _ es -> S.unions (map term es)
+      Weaken x e -> S.delete x (term e)
+      Delay e -> worst_fvs
+    
+    value v = case v of
+      Lambda x e -> S.delete x (term e)
+      Data _ xs  -> S.fromList xs
+      Literal _  -> S.empty
 
+
+restrict :: Ord k => M.Map k v -> S.Set k -> M.Map k v
+restrict m s = M.filterWithKey (\x _ -> x `S.notMember` s) m
 
 mapAccumLM :: (Monad m) => (acc -> x -> m (acc, y)) -> acc -> [x] -> m (acc, [y])
 mapAccumLM _ s []     = return (s, [])
