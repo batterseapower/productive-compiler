@@ -10,9 +10,10 @@ import Data.Word
 import Data.List
 import Data.IORef
 
-import Foreign.Ptr
-
 import qualified Data.Map as M
+import qualified Data.Set as S
+
+import Foreign.Ptr
 
 import LLVM.Core
 import LLVM.ExecutionEngine
@@ -52,7 +53,7 @@ main = do
     f
 
 data CompileEnv = CE {
-    symbolValues :: M.Map Var (CodeGenFunction (Ptr ()) (Value (Ptr ())))
+    symbolValues :: M.Map Var (Value (Ptr ()))
   }
 
 data CompileState = CS {
@@ -124,12 +125,16 @@ tunnelIO2 control arg = do
     s <- liftIO $ readIORef s_ref
     return (s, fun)
 
--- NB: this code assumes Int32s fit into pointers! Probably safe, but...
 compile' :: CompileEnv -> CompileState -> Term
          -> (CompileState -> Value (Ptr ()) -> CodeGenFunction (Ptr ()) r)
          -> CodeGenFunction (Ptr ()) r
 compile' env s (Var x) k = compileVar env x >>= k s
-compile' env s (Value v) k = compileValue env s v >>= uncurry k
+compile' env s (Value v) k = case compileValue (M.keysSet (symbolValues env)) v of
+    Immediate get_value_ptr -> get_value_ptr >>= k s
+    HeapAllocated nwords poke -> do
+        value_ptr <- arrayMalloc nwords
+        s <- poke env s value_ptr
+        bitcast value_ptr >>= k s
 compile' env s (App e x) k = compile' env s e $ \s closure_ptr -> do
     arg_ptr <- compileVar env x
     
@@ -150,10 +155,10 @@ compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
         let define_block s = do
               defineBasicBlock alt_block
               field_base_ptr <- bitcast data_ptr :: CodeGenFunction (Ptr ()) (Value (Ptr (Ptr ())))
-              env <- forAccM_ env (xs `zip` [1..]) $ \env (x, offset) -> do
+              env <- forAccumLM_ env (xs `zip` [1..]) $ \env (x, offset) -> do
                   field_ptr <- getElementPtr field_base_ptr (offset :: Int32, ())
                   value_ptr <- load field_ptr
-                  return (env { symbolValues = M.insert x (return value_ptr) (symbolValues env) })
+                  return (env { symbolValues = M.insert x value_ptr (symbolValues env) })
               (s, result_ptr) <- compile' env s e $ \s result_ptr -> br join_block >> return (s, result_ptr)
               return (s, (result_ptr, alt_block))
         return ((constOf (dataConTag dc), alt_block), define_block)
@@ -168,20 +173,27 @@ compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
     defineBasicBlock join_block
     phi phi_data >>= k s
 compile' env s (Let x e_bound e_body) k = compile' env s e_bound $ \s bound_ptr -> do
-    compile' (env { symbolValues = M.insert x (return bound_ptr) (symbolValues env) }) s e_bound k
+    compile' (env { symbolValues = M.insert x bound_ptr (symbolValues env) }) s e_bound k
 compile' env s (LetRec xvs e_body) k = do
-    -- FIXME: this does not work properly
-    (env, xvs) <- mapAccumLM (\env (x, v) -> do {
-                delay_cell_ptr <- alloca :: CodeGenFunction (Ptr ()) (Value (Ptr (Ptr ())));
-                return (env { symbolValues = M.insert x (load delay_cell_ptr) (symbolValues env) }, (delay_cell_ptr, v))
-              }) env xvs
+    -- Decide how each value will be allocated
+    let avails = S.fromList (map fst xvs) `S.union` M.keysSet (symbolValues env)
+        (nwords, get_value_ptrs_pokes) = forAccumL 0 xvs $ \nwords_total (x, v) -> case compileValue avails v of
+                                                                     Immediate get_value_ptr   -> (nwords_total,          (x, \_         -> get_value_ptr >>= bitcast,                  Nothing))
+                                                                     HeapAllocated nwords poke -> (nwords_total + nwords, (x, \block_ptr -> getElementPtr block_ptr (nwords_total, ()), Just poke))
     
-    s <- forAccM_ s xvs $ \s (delay_cell_ptr, v) -> do
-        (s, value_ptr) <- compileValue env s v
-        store value_ptr delay_cell_ptr
-        return s
+    -- Allocate enough memory for all the values to fit in
+    block_ptr <- arrayMalloc nwords
+    -- We can predict the values each variable has before we actually intialize them. This is essential to tie the knot.
+    (value_ptrs, pokes) <- fmap unzip $ forM get_value_ptrs_pokes $ \(x, get_value_ptr, mb_poke) -> do
+        value_ptr <- get_value_ptr block_ptr
+        value_ptr' <- bitcast value_ptr :: CodeGenFunction (Ptr ()) (Value (Ptr ()))
+        return ((x, value_ptr'), \env s -> maybe (return s) (\poke -> poke env s value_ptr) mb_poke :: CodeGenFunction (Ptr ()) CompileState)
     
-    compile' env s e_body k
+    -- Create the extended environment with the new predictions, and actually initialize the values by using that environment
+    let env' = env { symbolValues = M.fromList value_ptrs `M.union` symbolValues env }
+    s <- forAccumLM_ s pokes (\s poke -> poke env' s)
+    
+    compile' env' s e_body k
 compile' env s (PrimOp pop es) k = cpsBindN [TH (\s (k :: CompileState -> Value Int32 -> m r) -> compile' env s e (\s value_ptr -> bitcast value_ptr >>= k s)) | e <- es] s $ \s arg_ints -> do
     res_int <- case (pop, arg_ints) of
         (Add,      [i1, i2]) -> add i1 i2
@@ -194,16 +206,19 @@ compile' env s (Delay e) k = error "TODO: unimplemented"
 
 compileVar :: CompileEnv -> Var -> CodeGenFunction (Ptr ()) (Value (Ptr ()))
 compileVar env x = case M.lookup x (symbolValues env) of
-    Nothing            -> error $ "Unbound variable " ++ show x
-    Just get_value_ptr -> get_value_ptr
+    Nothing        -> error $ "Unbound variable " ++ show x
+    Just value_ptr -> return value_ptr
 
-compileValue :: CompileEnv -> CompileState -> Val -> CodeGenFunction (Ptr ()) (CompileState, Value (Ptr ()))
-compileValue env s v = case v of
-    Literal l  -> fmap ((,) s) $ bitcast (valueOf l)
-    Data dc xs -> do
-        -- Allocate space for one pointer per data item, and one pointer for the tag
-        data_ptr <- arrayMalloc (1 + genericLength xs :: Word32) :: CodeGenFunction (Ptr ()) (Value (Ptr (Ptr ())))
-    
+data ValueBuilder = Immediate (CodeGenFunction (Ptr ()) (Value (Ptr ())))
+                  | HeapAllocated Word32 (CompileEnv -> CompileState -> Value (Ptr (Ptr ())) -> CodeGenFunction (Ptr ()) CompileState)
+
+compileValue :: S.Set Var -> Val -> ValueBuilder
+compileValue avails v = case v of
+    -- Do not allocate space: we will pack Int32s into pointers
+    -- NB: this code assumes Int32s fit into pointers! Probably safe, but...
+    Literal l  -> Immediate $ bitcast (valueOf l)
+    -- Allocate space for one pointer per data item, and one pointer for the tag
+    Data dc xs -> HeapAllocated (1 + genericLength xs) $ \env s data_ptr -> do
         -- Poke in the tag
         tag_ptr <- bitcast data_ptr :: CodeGenFunction (Ptr ()) (Value (Ptr Int32))
         store (valueOf (dataConTag dc)) tag_ptr
@@ -214,17 +229,15 @@ compileValue env s v = case v of
             value_ptr <- compileVar env x
             store value_ptr field_ptr
     
-        fmap ((,) s) $ bitcast data_ptr
-    Lambda x e -> do
+        return s
+    -- Allocate space for one pointer per closure variable, and one pointer for the code
+    Lambda x e -> HeapAllocated (1 + fromIntegral (S.size avails)) $ \env s closure_ptr -> do
         let (name:names) = functionNameSupply s
-            (get_in_closure_values, get_out_closure_values) = unzip $ flip map ([1..] `zip` M.toList (symbolValues env)) $
-                                                        \(offset, (x, get_value_ptr)) -> let reload_value_ptr closure_ptr = do
-                                                                                                field_ptr <- getElementPtr closure_ptr (offset :: Int32, ())
-                                                                                                load field_ptr
-                                                                                         in ((offset, get_value_ptr), (x, reload_value_ptr))
-        
-        -- Allocate space for one pointer per closure variable, and one pointer for the code
-        closure_ptr <- arrayMalloc (1 + genericLength get_in_closure_values :: Word32) :: CodeGenFunction (Ptr ()) (Value (Ptr (Ptr ())))
+            (closed_value_ptrs, get_closure_value_ptrs) = unzip $ flip map ([1..] `zip` M.toList (symbolValues env)) $
+                                                        \(offset, (x, value_ptr)) -> let get_value_ptr closure_ptr = do
+                                                                                            field_ptr <- getElementPtr closure_ptr (offset :: Int32, ())
+                                                                                            load field_ptr
+                                                                                     in ((offset, value_ptr), (x, get_value_ptr))
         
         -- Poke in the code
         fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction (Ptr ()) (Function (Ptr (Ptr () -> Ptr () -> IO (Ptr ()))))
@@ -232,18 +245,21 @@ compileValue env s v = case v of
         store fun_ptr fun_ptr_ptr
         
         -- Poke in the closure variables
-        forM get_in_closure_values $ \(offset, get_value_ptr) -> do
+        forM closed_value_ptrs $ \(offset, value_ptr) -> do
             field_ptr <- getElementPtr closure_ptr (offset, ())
-            value_ptr <- get_value_ptr
             store value_ptr field_ptr
         
         -- Pend the definition of the code for function referened by that closure
         let define_function s = fmap (\(s, fun_ptr :: Function (Ptr (Ptr ()) -> Ptr () -> IO (Ptr ()))) -> s) $ tunnelIO2 (createNamedFunction ExternalLinkage name) $ \closure_ptr arg_ptr -> do
-                closed_value_ptrs <- forM get_out_closure_values $ \(x, reload_value_ptr) -> do
-                    value_ptr <- reload_value_ptr closure_ptr
-                    return (x, return value_ptr)
-                compile' (env { symbolValues = M.insert x (return arg_ptr) (M.fromList closed_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
-        fmap ((,) (s { functionNameSupply = names, pendingFunctions = define_function : pendingFunctions s })) $ bitcast closure_ptr
+                closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
+                compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap ((,) s) (ret value_ptr)
+        return (s { functionNameSupply = names, pendingFunctions = define_function : pendingFunctions s })
+
+
+-- TODO: use this to trim closure size
+-- termFreeVars :: Term -> S.Set Var -> S.Set Var
+-- termFreeVars (Var x) _ = S.singleton x
+-- termFreeVars 
 
 
 mapAccumLM :: (Monad m) => (acc -> x -> m (acc, y)) -> acc -> [x] -> m (acc, [y])
@@ -271,8 +287,12 @@ cpsBindN :: [TypeHack s a m]
 cpsBindN []     s k = k s []
 cpsBindN (r:rs) s k = unTH r s $ \s x -> cpsBindN rs s $ \s xs -> k s (x:xs)
 
-forAccM_ :: Monad m => acc -> [a] -> (acc -> a -> m acc) -> m acc
-forAccM_ acc []     _ = return acc
-forAccM_ acc (x:xs) f = do
+forAccumLM_ :: Monad m => acc -> [a] -> (acc -> a -> m acc) -> m acc
+forAccumLM_ acc []     _ = return acc
+forAccumLM_ acc (x:xs) f = do
     acc <- f acc x
-    forAccM_ acc xs f
+    forAccumLM_ acc xs f
+
+forAccumL :: acc -> [a] -> (acc -> a -> (acc, b)) -> (acc, [b])
+forAccumL acc []     _ = (acc, [])
+forAccumL acc (x:xs) f = case f acc x of (acc, y) -> case forAccumL acc xs f of (acc, ys) -> (acc, y:ys)
