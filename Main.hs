@@ -36,6 +36,10 @@ nothingDataCon, justDataCon :: DataCon
 nothingDataCon = DC "Nothing" 0
 justDataCon = DC "Just" 1
 
+nilDataCon, consDataCon :: DataCon
+nilDataCon = DC "Nil" 0
+consDataCon = DC "Cons" 1
+
 data PrimOp = Add | Subtract | Multiply
 
 -- A strict functional language
@@ -68,8 +72,23 @@ test_term :: Term
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
 -- Complex function use. Needs to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
+-- Letrec:
+test_term = LetRec [("ones", Data consDataCon ["one", "ones"]),
+                    ("one", Literal 1),
+                    ("zero", Literal 0),
+                    ("length", Lambda "xs" (Case (Var "xs") [(nilDataCon, [], Var "zero"),
+                                                             (consDataCon, ["_", "ys"], PrimOp Add [Value (Literal 1), Var "length" `App` "ys"])])),
+                    ("list0", Data nilDataCon []),
+                    ("list1", Data consDataCon ["one", "list0"]),
+                    ("list2", Data consDataCon ["zero", "list1"])] $
+            Case (Var "ones") [(consDataCon, ["y", "ys"], PrimOp Add [Var "y", Var "length" `App` "list2"])]
 -- Trivial delay
-test_term = Delay (Value (Literal 1))
+--test_term = Delay (Value (Literal 1))
+-- Reentrant delay
+-- test_term = Let "foo" (Value (Lambda "x" (Delay (PrimOp Add [Var "x", Var "x"])))) $
+--             Let "one" (Value (Literal 1)) $
+--             Let "two" (Value (Literal 2)) $
+--             PrimOp Add [Var "foo" `App` "one", Var "foo" `App` "two"]
 
 main :: IO ()
 main = do
