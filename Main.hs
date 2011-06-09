@@ -150,7 +150,7 @@ prepareLinkDemands s = (mapM (fmap castFunPtrToPtr . getPointerToFunction) linka
 
 compileTop :: CompileEnv -> CompileState -> Term -> CodeGenModule (CompileState, Function (IO Int32))
 compileTop env s e = do
-    (s, fun) <- tunnelIO (createFunction InternalLinkage) $ compile' env s e $ \s value_ptr -> fmap (const s) (ret value_ptr)
+    (s, fun) <- tunnelIO (createFunction InternalLinkage) $ compile env s e $ \s value_ptr -> fmap (const s) (ret value_ptr)
     
     fmap ((,) s) $ createFunction InternalLinkage $ do
         -- For simplicity, we're going to assume that the code always returns an immediate integer
@@ -196,17 +196,17 @@ tunnelIO2 control arg = do
     s <- liftIO $ readIORef s_ref
     return (s, fun)
 
-compile' :: CompileEnv -> CompileState -> Term
-         -> (CompileState -> Value VoidPtr -> CodeGenFunction VoidPtr r)
-         -> CodeGenFunction VoidPtr r
-compile' env s (Var x) k = compileVar env x >>= k s
-compile' env s (Value v) k = case compileValue (M.keysSet (symbolValues env)) v of
+compile :: CompileEnv -> CompileState -> Term
+        -> (CompileState -> Value VoidPtr -> CodeGenFunction VoidPtr r)
+        -> CodeGenFunction VoidPtr r
+compile env s (Var x) k = compileVar env x >>= k s
+compile env s (Value v) k = case compileValue (M.keysSet (symbolValues env)) v of
     Immediate get_value_ptr -> get_value_ptr >>= k s
     HeapAllocated nwords poke -> do
         value_ptr <- arrayMalloc nwords
         s <- poke env s value_ptr
         bitcast value_ptr >>= k s
-compile' env s (App e x) k = compile' env s e $ \s closure_ptr -> do
+compile env s (App e x) k = compile env s e $ \s closure_ptr -> do
     arg_ptr <- compileVar env x
     
     fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Value (Ptr (Ptr (VoidPtr -> VoidPtr -> IO VoidPtr))))
@@ -214,7 +214,7 @@ compile' env s (App e x) k = compile' env s e $ \s closure_ptr -> do
     
     -- TODO: do I need to mark this as a tail call?
     call fun_ptr closure_ptr arg_ptr >>= k s
-compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
+compile env s (Case e alts) k = compile env s e $ \s data_ptr -> do
     -- Retrieve the tag:
     tag_ptr <- bitcast data_ptr :: CodeGenFunction VoidPtr (Value (Ptr Int32))
     tag <- load tag_ptr
@@ -231,7 +231,7 @@ compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
                   field_ptr <- getElementPtr field_base_ptr (offset :: Int32, ())
                   value_ptr <- load field_ptr
                   return (env { symbolValues = M.insert x value_ptr (symbolValues env) })
-              (s, result_ptr) <- compile' env s e $ \s result_ptr -> br join_block >> return (s, result_ptr)
+              (s, result_ptr) <- compile env s e $ \s result_ptr -> br join_block >> return (s, result_ptr)
               return (s, (result_ptr, alt_block))
         return ((constOf (dataConTag dc), alt_block), define_block)
     
@@ -244,9 +244,9 @@ compile' env s (Case e alts) k = compile' env s e $ \s data_ptr -> do
     unreachable
     defineBasicBlock join_block
     phi phi_data >>= k s
-compile' env s (Let x e_bound e_body) k = compile' env s e_bound $ \s bound_ptr -> do
-    compile' (env { symbolValues = M.insert x bound_ptr (symbolValues env) }) s e_body k
-compile' env s (LetRec xvs e_body) k = do
+compile env s (Let x e_bound e_body) k = compile env s e_bound $ \s bound_ptr -> do
+    compile (env { symbolValues = M.insert x bound_ptr (symbolValues env) }) s e_body k
+compile env s (LetRec xvs e_body) k = do
     -- Decide how each value will be allocated
     let avails = S.fromList (map fst xvs) `S.union` M.keysSet (symbolValues env)
         (nwords, get_value_ptrs_pokes) = forAccumL 0 xvs $ \nwords_total (x, v) -> case compileValue avails v of
@@ -265,16 +265,16 @@ compile' env s (LetRec xvs e_body) k = do
     let env' = env { symbolValues = M.fromList value_ptrs `M.union` symbolValues env }
     s <- forAccumLM_ s pokes (\s poke -> poke env' s)
     
-    compile' env' s e_body k
-compile' env s (PrimOp pop es) k = cpsBindN [TH (\s (k :: CompileState -> Value Int32 -> m r) -> compile' env s e (\s value_ptr -> ptrtoint value_ptr >>= k s)) | e <- es] s $ \s arg_ints -> do
+    compile env' s e_body k
+compile env s (PrimOp pop es) k = cpsBindN [TH (\s (k :: CompileState -> Value Int32 -> m r) -> compile env s e (\s value_ptr -> ptrtoint value_ptr >>= k s)) | e <- es] s $ \s arg_ints -> do
     res_int <- case (pop, arg_ints) of
         (Add,      [i1, i2]) -> add i1 i2
         (Subtract, [i1, i2]) -> sub i1 i2
         (Multiply, [i1, i2]) -> mul i1 i2
         _ -> error "Bad primitive operation arity"
     inttoptr res_int >>= k s
-compile' env s (Weaken x e) k = compile' (env { symbolValues = M.delete x (symbolValues env) }) s e k
-compile' env s (Delay e) k = do
+compile env s (Weaken x e) k = compile (env { symbolValues = M.delete x (symbolValues env) }) s e k
+compile env s (Delay e) k = do
     -- Create a block of memory we can use to marshal our lexical environment around
     block_ptr <- arrayAlloca (fromIntegral (M.size (symbolValues env)) :: Word32) :: CodeGenFunction VoidPtr (Value (Ptr VoidPtr))
     get_block_value_ptrs <- forM ([0..] `zip` M.toList (symbolValues env)) $ \(offset, (x, value_ptr)) -> do
@@ -285,7 +285,7 @@ compile' env s (Delay e) k = do
             fmap ((,) x) $ load field_ptr
     
     -- We transfer control to the function pointer stored in the global with this name
-    trampoline_global_ptr_ref <- liftIO $ newIORef $ error "compile'(Delay): IORef not filled"
+    trampoline_global_ptr_ref <- liftIO $ newIORef $ error "compile(Delay): IORef not filled"
     
     -- Create Haskell trampoline that will be invoked when we first need to compile this
     reenter_compiler_ptr <- liftIO $ fixIO $ \reenter_compiler_ptr -> wrapDelay $ \block_ptr -> do
@@ -296,7 +296,7 @@ compile' env s (Delay e) k = do
             (s, replacement_func_value) <- tunnelIO1 (createFunction InternalLinkage) $ \(block_ptr :: Value (Ptr VoidPtr)) -> do
                 -- FIXME: in the future I may need a different CompileState here
                 value_ptrs <- mapM ($ block_ptr) get_block_value_ptrs
-                compile' (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
+                compile (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
             
             let (get_linkable_fun_ptrs, link) = prepareLinkDemands s
             
@@ -365,7 +365,7 @@ compileValue avails v = case v of
         -- Define the function corresponding to the lambda body
         (s, fun_ptr) <- liftCodeGenModule $ tunnelIO2 (createFunction InternalLinkage) $ \closure_ptr arg_ptr -> do
             closure_value_ptrs <- forM get_closure_value_ptrs $ \(x, get_value_ptr) -> fmap ((,) x) $ get_value_ptr closure_ptr
-            compile' (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap (const s) (ret value_ptr)
+            compile (env { symbolValues = M.insert x arg_ptr (M.fromList closure_value_ptrs) }) s e $ \s value_ptr -> fmap (const s) (ret value_ptr)
         
         -- Poke in the code
         fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Function (Ptr (Ptr VoidPtr -> VoidPtr -> IO VoidPtr)))
