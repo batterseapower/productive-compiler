@@ -56,7 +56,7 @@ data Val = Lambda Var Term
 
 test_term :: Term
 -- Simple arithmetic:
-test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
+--test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
 -- Test that exposed "let" miscompilation:
 --test_term = Let "x" (Value (Literal 1)) (Value (Literal 2))
 -- Simple case branches:
@@ -69,7 +69,7 @@ test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
 -- Complex function use. Needs to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
 -- Trivial delay
---test_term = Delay (Value (Literal 1))
+test_term = Delay (Value (Literal 1))
 
 main :: IO ()
 main = do
@@ -117,12 +117,16 @@ main = do
     (poke_func :: IO Int32) >>= print -- 12
     (peek_func :: IO Int32) >>= print -- 12
     
-    func <- simpleFunction' $ do
-        fmap generateFunction build_function
+    (fun, linked_fun_ptrs, link) <- simpleFunction' $ do
+        (fun, linkable_funs, link) <- build_function
+        return (liftM3 (,,) (generateFunction fun) (mapM (fmap castFunPtrToPtr . getPointerToFunction) linkable_funs) (return link))
+    
+    -- We must fixup links before we run the actual compiled code, or Delays may read some empty IORefs
+    link linked_fun_ptrs
     
     -- Run the compiled code
     putStrLn "Here we go:"
-    func >>= print
+    fun >>= print
 
 
 simpleFunction' :: CodeGenModule (EngineAccess b) -> IO b
@@ -155,12 +159,18 @@ data CompileEnv = CE {
     symbolValues :: M.Map Var (Value VoidPtr)
   }
 
-type CompileState = ()
+type LinkableType = Ptr (Ptr VoidPtr -> IO VoidPtr) -- Keep the system monotyped for now, for simplicity
+data CompileState = CS {
+    linkDemands :: [(Global LinkableType, IORef (Ptr LinkableType))]
+  }
 
 newtype CompileM a = CM { unCM :: CompileEnv -> CompileState -> CodeGenModule (CompileState, a) }
 
-runCompileM :: CompileM a -> CompileEnv -> CodeGenModule a
-runCompileM cm env = fmap snd (unCM cm env ())
+runCompileM :: CompileM a -> CompileEnv -> CodeGenModule (a, [Global LinkableType], [Ptr LinkableType] -> IO ())
+runCompileM cm env = do
+    (s, x) <- unCM cm env (CS { linkDemands = [] })
+    let (linkable_funs, linkable_ptr_refs) = unzip (linkDemands s)
+    return (x, linkable_funs, zipWithM_ writeIORef linkable_ptr_refs)
 
 instance Functor CompileM where
     fmap = liftM
@@ -305,7 +315,7 @@ compile' env s (Delay e) k = do
             fmap ((,) x) $ load field_ptr
     
     -- We transfer control to the function pointer stored in the global with this name
-    let trampoline_global_name = "foo_name" -- FIXME: fresh name
+    trampoline_global_ptr_ref <- liftIO $ newIORef $ error "compile'(Delay): IORef not filled"
     
     -- Create Haskell trampoline that will be invoked when we first need to compile this
     reenter_compiler_ptr <- liftIO $ fixIO $ \reenter_compiler_ptr -> wrapDelay $ \block_ptr -> do
@@ -318,9 +328,10 @@ compile' env s (Delay e) k = do
                 _s <- compile' (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
                 return ()
             
-            trampoline_global <- newNamedGlobal False ExternalLinkage trampoline_global_name :: CodeGenModule (Global (Ptr (Ptr VoidPtr -> IO VoidPtr)))
+            trampoline_global_ptr <- liftIO $ readIORef trampoline_global_ptr_ref
             fmap generateFunction $ createFunction InternalLinkage $ \block_ptr -> do
                 -- Make sure that next time we execute this Delay we jump right to the replacement
+                trampoline_global <- staticGlobal False trampoline_global_ptr :: CodeGenFunction VoidPtr (Global (Ptr (Ptr VoidPtr -> IO VoidPtr)))
                 store replacement_func_value trampoline_global
                 -- Call the replacement code right now to get the work done
                 call replacement_func_value block_ptr >>= ret
@@ -329,8 +340,11 @@ compile' env s (Delay e) k = do
         freeHaskellFunPtr reenter_compiler_ptr -- TODO: I probably shouldn't free this function while it is still running!
         fixup_func block_ptr
     
+    -- Prepare link
+    trampoline_global <- liftCodeGenModule $ createGlobal False ExternalLinkage (constOf (castFunPtrToPtr reenter_compiler_ptr))
+    s <- return $ s { linkDemands = (trampoline_global, trampoline_global_ptr_ref) : linkDemands s }
+    
     -- Transfer control
-    trampoline_global <- liftCodeGenModule $ createNamedGlobal False ExternalLinkage trampoline_global_name (constOf (castFunPtrToPtr reenter_compiler_ptr))
     trampoline_ptr <- load trampoline_global
     call trampoline_ptr block_ptr >>= k s
 
