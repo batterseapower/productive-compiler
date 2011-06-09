@@ -13,6 +13,7 @@ import Data.IORef
 import qualified Data.Map as M
 import qualified Data.Set as S
 
+import System.Directory (doesFileExist)
 import System.IO (fixIO)
 
 import Foreign.Ptr
@@ -55,7 +56,7 @@ data Val = Lambda Var Term
 
 test_term :: Term
 -- Simple arithmetic:
---test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
+test_term = PrimOp Add [Value (Literal 1), Value (Literal 2)]
 -- Test that exposed "let" miscompilation:
 --test_term = Let "x" (Value (Literal 1)) (Value (Literal 2))
 -- Simple case branches:
@@ -68,7 +69,7 @@ test_term :: Term
 -- Complex function use. Needs to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
 -- Trivial delay
-test_term = Delay (Value (Literal 1))
+--test_term = Delay (Value (Literal 1))
 
 main :: IO ()
 main = do
@@ -76,6 +77,7 @@ main = do
     
     let build_function = runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
     
+    {-
     -- Build a LLVM Module containing our code
     m <- newModule
     (func_value, mappings) <- defineModule m (liftM2 (,) build_function getGlobalMappings)
@@ -87,10 +89,59 @@ main = do
         addModuleProvider prov
         addGlobalMappings mappings
         generateFunction func_value
+    -}
+    
+    (poke_func_ptr, global_ptr) <- simpleFunction' $ do
+        global <- createNamedGlobal False ExternalLinkage "dummy_constant" (constOf (10 :: Int32)) :: CodeGenModule (Global Int32)
+        poke_func <- createNamedFunction ExternalLinkage "the_poker" $ do
+            x <- load global
+            y <- add x (1 :: Int32)
+            store y global
+            ret y
+        return (liftM2 (,) (getPointerToFunction poke_func) (getPointerToFunction global))
+    
+    peek_func <- simpleFunction' $ do
+        --global <- newNamedGlobal False ExternalLinkage "dummy_constant" :: CodeGenModule (Global Int32)
+        
+        --poker <- newNamedFunction ExternalLinkage "the_poker" :: CodeGenModule (Function (IO Int32))
+        fmap generateFunction $ createFunction InternalLinkage $ do
+            --poker <- staticFunction poke_func_ptr :: CodeGenFunction Int32 (Function (IO Int32))
+            --x <- call poker
+            global <- staticGlobal global_ptr :: CodeGenFunction Int32 (Global Int32)
+            x <- load global
+            ret x
+    
+    let poke_func = mkIOInt32 poke_func_ptr
+    
+    (poke_func :: IO Int32) >>= print -- 11
+    (poke_func :: IO Int32) >>= print -- 12
+    (peek_func :: IO Int32) >>= print -- 12
+    
+    func <- simpleFunction' $ do
+        fmap generateFunction build_function
     
     -- Run the compiled code
     putStrLn "Here we go:"
     func >>= print
+
+
+simpleFunction' :: CodeGenModule (EngineAccess b) -> IO b
+simpleFunction' bld = do
+    m <- newModule
+    (act, mappings) <- defineModule m (liftM2 (,) bld getGlobalMappings)
+    
+    -- Write code:
+    let go n = do
+            let fp = "output." ++ show n ++ ".bc"
+            bad <- doesFileExist fp
+            if bad then go (n + 1) else writeBitcodeToFile fp m
+    go (0 :: Integer)
+    
+    prov <- createModuleProviderForExistingModule m
+    runEngineAccess $ do
+        addModuleProvider prov
+        addGlobalMappings mappings
+        act
 
 
 -- We use this type to represent values in our system that are *either*
@@ -260,15 +311,15 @@ compile' env s (Delay e) k = do
     reenter_compiler_ptr <- liftIO $ fixIO $ \reenter_compiler_ptr -> wrapDelay $ \block_ptr -> do
         -- Build a Module containing the replacement code and fixup code that transfers
         -- control to the replacement code right now
-        fixup_func <- simpleFunction $ do
+        fixup_func <- simpleFunction' $ do
             replacement_func_value <- createFunction InternalLinkage $ \(block_ptr :: Value (Ptr VoidPtr)) -> do
                 -- FIXME: in the future I may need a different CompileState here
                 value_ptrs <- mapM ($ block_ptr) get_block_value_ptrs
-                _s <- compile' (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr)) :: CodeGenFunction VoidPtr CompileState
+                _s <- compile' (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
                 return ()
             
             trampoline_global <- newNamedGlobal False ExternalLinkage trampoline_global_name :: CodeGenModule (Global (Ptr (Ptr VoidPtr -> IO VoidPtr)))
-            createFunction InternalLinkage $ \block_ptr -> do
+            fmap generateFunction $ createFunction InternalLinkage $ \block_ptr -> do
                 -- Make sure that next time we execute this Delay we jump right to the replacement
                 store replacement_func_value trampoline_global
                 -- Call the replacement code right now to get the work done
@@ -285,6 +336,9 @@ compile' env s (Delay e) k = do
 
 foreign import ccall "wrapper"
     wrapDelay :: (Ptr VoidPtr -> IO VoidPtr) -> IO (FunPtr (Ptr VoidPtr -> IO VoidPtr))
+
+foreign import ccall "dynamic" 
+    mkIOInt32 :: FunPtr (IO Int32) -> IO Int32
 
 compileVar :: CompileEnv -> Var -> CodeGenFunction VoidPtr (Value VoidPtr)
 compileVar env x = case M.lookup x (symbolValues env) of
