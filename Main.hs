@@ -2,6 +2,7 @@
 {-# OPTIONS_GHC -Wall -fno-warn-name-shadowing #-}
 module Main (main) where
 
+import Control.Arrow (first)
 import Control.Monad
 import Control.Monad.IO.Class
 
@@ -67,36 +68,37 @@ test_term :: Term
 --test_term = Case (Value (Data trueDataCon [])) [(trueDataCon, [], Value (Literal 1)), (falseDataCon, [], Value (Literal 2))]
 -- Complex case branches:
 --test_term = Let "x" (Value (Literal 5)) $ Case (Value (Data justDataCon ["x"])) [(nothingDataCon, [], Value (Literal 1)), (justDataCon, ["y"], Var "y")]
--- FIXME below this line
 -- Simple function use. Does not need to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Value (Lambda "y" (PrimOp Multiply [Var "y", Value (Literal 4)])) `App` "x")
 -- Complex function use. Needs to reference closure:
 --test_term = Let "x" (PrimOp Add [Value (Literal 1), Value (Literal 2)]) (Let "four" (Value (Literal 4)) (Value (Lambda "y" (PrimOp Multiply [Var "y", Var "four"])) `App` "x"))
 -- Letrec:
-test_term = LetRec [("ones", Data consDataCon ["one", "ones"]),
-                    ("one", Literal 1),
-                    ("zero", Literal 0),
-                    ("length", Lambda "xs" (Case (Var "xs") [(nilDataCon, [], Var "zero"),
-                                                             (consDataCon, ["_", "ys"], PrimOp Add [Value (Literal 1), Var "length" `App` "ys"])])),
-                    ("list0", Data nilDataCon []),
-                    ("list1", Data consDataCon ["one", "list0"]),
-                    ("list2", Data consDataCon ["zero", "list1"])] $
-            Case (Var "ones") [(consDataCon, ["y", "ys"], PrimOp Add [Var "y", Var "length" `App` "list2"])]
+--test_term = LetRec [("ones", Data consDataCon ["one", "ones"]),
+--                    ("one", Literal 1),
+--                    ("zero", Literal 0),
+--                    ("length", Lambda "xs" (Case (Var "xs") [(nilDataCon, [], Var "zero"),
+--                                                             (consDataCon, ["_", "ys"], PrimOp Add [Value (Literal 1), Var "length" `App` "ys"])])),
+--                    ("list0", Data nilDataCon []),
+--                    ("list1", Data consDataCon ["one", "list0"]),
+--                    ("list2", Data consDataCon ["zero", "list1"])] $
+--            Case (Var "ones") [(consDataCon, ["y", "ys"], PrimOp Add [Var "y", Var "length" `App` "list2"])]
 -- Trivial delay
 --test_term = Delay (Value (Literal 1))
 -- Reentrant delay
--- test_term = Let "foo" (Value (Lambda "x" (Delay (PrimOp Add [Var "x", Var "x"])))) $
---             Let "one" (Value (Literal 1)) $
---             Let "two" (Value (Literal 2)) $
---             PrimOp Add [Var "foo" `App` "one", Var "foo" `App` "two"]
+--test_term = Let "foo" (Value (Lambda "x" (Delay (PrimOp Add [Var "x", Var "x"])))) $
+--            Let "one" (Value (Literal 1)) $
+--            Let "two" (Value (Literal 2)) $
+--            PrimOp Add [Var "foo" `App` "one", Var "foo" `App` "two"]
+-- Nested delay
+test_term = Delay (Delay (Value (Literal 1)))
 
 main :: IO ()
 main = do
     initializeNativeTarget
     
     (fun, linked_fun_ptrs, link) <- simpleFunction' $ do
-        (fun, linkable_funs, link) <- runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
-        return (liftM3 (,,) (generateFunction fun) (mapM (fmap castFunPtrToPtr . getPointerToFunction) linkable_funs) (return link))
+        ((get_linkable_fun_ptrs, link), fun) <- runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
+        return (liftM3 (,,) (generateFunction fun) get_linkable_fun_ptrs (return link))
     
     -- We must fixup links before we run the actual compiled code, or Delays may read some empty IORefs
     link linked_fun_ptrs
@@ -138,16 +140,17 @@ data CompileEnv = CE {
 
 type LinkableType = Ptr (Ptr VoidPtr -> IO VoidPtr) -- Keep the system monotyped for now, for simplicity
 data CompileState = CS {
-    linkDemands :: [(Global LinkableType, IORef (Ptr LinkableType))]
+    linkDemands :: [(Global LinkableType, Ptr LinkableType -> IO ())]
   }
 
 newtype CompileM a = CM { unCM :: CompileEnv -> CompileState -> CodeGenModule (CompileState, a) }
 
-runCompileM :: CompileM a -> CompileEnv -> CodeGenModule (a, [Global LinkableType], [Ptr LinkableType] -> IO ())
-runCompileM cm env = do
-    (s, x) <- unCM cm env (CS { linkDemands = [] })
-    let (linkable_funs, linkable_ptr_refs) = unzip (linkDemands s)
-    return (x, linkable_funs, zipWithM_ writeIORef linkable_ptr_refs)
+runCompileM :: CompileM a -> CompileEnv -> CodeGenModule ((EngineAccess [Ptr LinkableType], [Ptr LinkableType] -> IO ()), a)
+runCompileM cm env = fmap (first prepareLinkDemands) $ unCM cm env (CS { linkDemands = [] })
+
+prepareLinkDemands :: CompileState -> (EngineAccess [Ptr LinkableType], [Ptr LinkableType] -> IO ())
+prepareLinkDemands s = (mapM (fmap castFunPtrToPtr . getPointerToFunction) linkable_funs, sequence_ . zipWith ($) store_linkable_ptr_refs)
+  where (linkable_funs, store_linkable_ptr_refs) = unzip (linkDemands s)
 
 instance Functor CompileM where
     fmap = liftM
@@ -186,6 +189,19 @@ tunnelIO control arg = do
     s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
     fun <- control $ do
         s <- arg
+        liftIO $ writeIORef s_ref s
+    s <- liftIO $ readIORef s_ref
+    return (s, fun)
+
+tunnelIO1 :: (MonadIO m, MonadIO n)
+          => ((arg1 -> m ()) -> n b)
+          -> (arg1 -> m c)
+          -> n (c, b)
+tunnelIO1 control arg = do
+    -- Urgh, have to resort to tunneling through IORef to get the new State out
+    s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
+    fun <- control $ \arg1 -> do
+        s <- arg arg1
         liftIO $ writeIORef s_ref s
     s <- liftIO $ readIORef s_ref
     return (s, fun)
@@ -298,20 +314,27 @@ compile' env s (Delay e) k = do
     reenter_compiler_ptr <- liftIO $ fixIO $ \reenter_compiler_ptr -> wrapDelay $ \block_ptr -> do
         -- Build a Module containing the replacement code and fixup code that transfers
         -- control to the replacement code right now
-        fixup_func <- simpleFunction' $ do
-            replacement_func_value <- createFunction InternalLinkage $ \(block_ptr :: Value (Ptr VoidPtr)) -> do
+        (fixup_func, linked_fun_ptrs, link) <- simpleFunction' $ do
+            s <- return $ CS { linkDemands = [] }
+            (s, replacement_func_value) <- tunnelIO1 (createFunction InternalLinkage) $ \(block_ptr :: Value (Ptr VoidPtr)) -> do
                 -- FIXME: in the future I may need a different CompileState here
                 value_ptrs <- mapM ($ block_ptr) get_block_value_ptrs
-                _s <- compile' (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
-                return ()
+                compile' (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
+            
+            let (get_linkable_fun_ptrs, link) = prepareLinkDemands s
             
             trampoline_global_ptr <- liftIO $ readIORef trampoline_global_ptr_ref
-            fmap generateFunction $ createFunction InternalLinkage $ \block_ptr -> do
+            fixup_func <- createFunction InternalLinkage $ \block_ptr -> do
                 -- Make sure that next time we execute this Delay we jump right to the replacement
                 trampoline_global <- staticGlobal False trampoline_global_ptr :: CodeGenFunction VoidPtr (Global (Ptr (Ptr VoidPtr -> IO VoidPtr)))
                 store replacement_func_value trampoline_global
                 -- Call the replacement code right now to get the work done
                 call replacement_func_value block_ptr >>= ret
+            
+            return $ liftM3 (,,) (generateFunction fixup_func) get_linkable_fun_ptrs (return link)
+        
+        -- Once again, make sure that we resolve links generated by Delay before we enter the code
+        link linked_fun_ptrs
         
         -- Do the fixup
         freeHaskellFunPtr reenter_compiler_ptr -- TODO: I probably shouldn't free this function while it is still running!
@@ -319,7 +342,7 @@ compile' env s (Delay e) k = do
     
     -- Prepare link
     trampoline_global <- liftCodeGenModule $ createGlobal False ExternalLinkage (constOf (castFunPtrToPtr reenter_compiler_ptr))
-    s <- return $ s { linkDemands = (trampoline_global, trampoline_global_ptr_ref) : linkDemands s }
+    s <- return $ s { linkDemands = (trampoline_global, writeIORef trampoline_global_ptr_ref) : linkDemands s }
     
     -- Transfer control
     trampoline_ptr <- load trampoline_global
