@@ -97,7 +97,7 @@ main = do
     initializeNativeTarget
     
     (fun, linked_fun_ptrs, link) <- simpleFunction' $ do
-        ((get_linkable_fun_ptrs, link), fun) <- runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
+        ((get_linkable_fun_ptrs, link), fun) <- fmap (first prepareLinkDemands) $ compileTop (CE { symbolValues = M.empty }) (CS { linkDemands = [] }) test_term
         return (liftM3 (,,) (generateFunction fun) get_linkable_fun_ptrs (return link))
     
     -- We must fixup links before we run the actual compiled code, or Delays may read some empty IORefs
@@ -143,42 +143,19 @@ data CompileState = CS {
     linkDemands :: [(Global LinkableType, Ptr LinkableType -> IO ())]
   }
 
-newtype CompileM a = CM { unCM :: CompileEnv -> CompileState -> CodeGenModule (CompileState, a) }
-
-runCompileM :: CompileM a -> CompileEnv -> CodeGenModule ((EngineAccess [Ptr LinkableType], [Ptr LinkableType] -> IO ()), a)
-runCompileM cm env = fmap (first prepareLinkDemands) $ unCM cm env (CS { linkDemands = [] })
-
 prepareLinkDemands :: CompileState -> (EngineAccess [Ptr LinkableType], [Ptr LinkableType] -> IO ())
 prepareLinkDemands s = (mapM (fmap castFunPtrToPtr . getPointerToFunction) linkable_funs, sequence_ . zipWith ($) store_linkable_ptr_refs)
   where (linkable_funs, store_linkable_ptr_refs) = unzip (linkDemands s)
 
-instance Functor CompileM where
-    fmap = liftM
 
-instance Monad CompileM where
-    return x = CM $ \_ s -> return (s, x)
-    mx >>= fxmy = CM $ \e s -> unCM mx e s >>= \(s, x) -> unCM (fxmy x) e s
-
-liftCGM :: CodeGenModule a -> CompileM a
-liftCGM cgm = CM $ \_ s -> fmap ((,) s) cgm
-
-
-compileTop :: Term -> CompileM (Function (IO Int32))
-compileTop e = do
-    work <- compile e
-    --printf <- liftCGM (newNamedFunction ExternalLinkage "printf" :: TFunction (Ptr Int8 -> VarArgs Int32))
-    --format_string <- liftCGM (createStringNul "%d")
+compileTop :: CompileEnv -> CompileState -> Term -> CodeGenModule (CompileState, Function (IO Int32))
+compileTop env s e = do
+    (s, fun) <- tunnelIO (createFunction InternalLinkage) $ compile' env s e $ \s value_ptr -> fmap (const s) (ret value_ptr)
     
-    liftCGM $ createFunction InternalLinkage $ do
+    fmap ((,) s) $ createFunction InternalLinkage $ do
         -- For simplicity, we're going to assume that the code always returns an immediate integer
-        value <- call work >>= ptrtoint :: CodeGenFunction Int32 (Value Int32)
+        value <- call fun >>= ptrtoint :: CodeGenFunction Int32 (Value Int32)
         ret value :: CodeGenFunction Int32 Terminate
-        
-        --_nchars <- call printf format_string value
-        --ret ()
-
-compile :: Term -> CompileM (Function (IO VoidPtr))
-compile e = CM $ \env s -> tunnelIO (createFunction InternalLinkage) $ compile' env s e (\s value_ptr -> fmap (const s) (ret value_ptr))
 
 tunnelIO :: (MonadIO m, MonadIO n)
          => (m () -> n b)
