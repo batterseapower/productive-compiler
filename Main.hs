@@ -50,8 +50,8 @@ data Term = Var Var
           | LetRec [(Var, Val)] Term
           | Let Var Term Term
           | PrimOp PrimOp [Term]
-          | Weaken Var Term           -- Used to "forget" certain variables so we can keep closure size down
-          | Delay Term                -- Introduces code that returns control to the compiler
+          | Weaken Var Term -- Used to "forget" certain variables so we can keep closure size down even in the presence of Delay
+          | Delay Term      -- The compiler is non-strict in the contained Term. Generates code that returns control to the compiler
 
 data Val = Lambda Var Term
          | Data DataCon [Var]
