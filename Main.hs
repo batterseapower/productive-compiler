@@ -75,50 +75,8 @@ main :: IO ()
 main = do
     initializeNativeTarget
     
-    let build_function = runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
-    
-    {-
-    -- Build a LLVM Module containing our code
-    m <- newModule
-    (func_value, mappings) <- defineModule m (liftM2 (,) build_function getGlobalMappings)
-    writeBitcodeToFile "output.bc" m
-    
-    -- JIT-compile our code
-    prov <- createModuleProviderForExistingModule m
-    func <- runEngineAccess $ do
-        addModuleProvider prov
-        addGlobalMappings mappings
-        generateFunction func_value
-    -}
-    
-    (poke_func_ptr, global_ptr) <- simpleFunction' $ do
-        global <- createNamedGlobal False ExternalLinkage "dummy_constant" (constOf (10 :: Int32)) :: CodeGenModule (Global Int32)
-        poke_func <- createNamedFunction ExternalLinkage "the_poker" $ do
-            x <- load global
-            y <- add x (1 :: Int32)
-            store y global
-            ret y
-        return (liftM2 (,) (getPointerToFunction poke_func) (getPointerToFunction global))
-    
-    peek_func <- simpleFunction' $ do
-        --global <- newNamedGlobal False ExternalLinkage "dummy_constant" :: CodeGenModule (Global Int32)
-        
-        --poker <- newNamedFunction ExternalLinkage "the_poker" :: CodeGenModule (Function (IO Int32))
-        fmap generateFunction $ createFunction InternalLinkage $ do
-            --poker <- staticFunction poke_func_ptr :: CodeGenFunction Int32 (Function (IO Int32))
-            --x <- call poker
-            global <- staticGlobal False (castFunPtrToPtr global_ptr) :: CodeGenFunction Int32 (Global Int32)
-            x <- load global
-            ret x
-    
-    let poke_func = mkIOInt32 poke_func_ptr
-    
-    (poke_func :: IO Int32) >>= print -- 11
-    (poke_func :: IO Int32) >>= print -- 12
-    (peek_func :: IO Int32) >>= print -- 12
-    
     (fun, linked_fun_ptrs, link) <- simpleFunction' $ do
-        (fun, linkable_funs, link) <- build_function
+        (fun, linkable_funs, link) <- runCompileM (compileTop test_term) (CE { symbolValues = M.empty })
         return (liftM3 (,,) (generateFunction fun) (mapM (fmap castFunPtrToPtr . getPointerToFunction) linkable_funs) (return link))
     
     -- We must fixup links before we run the actual compiled code, or Delays may read some empty IORefs
@@ -350,9 +308,6 @@ compile' env s (Delay e) k = do
 
 foreign import ccall "wrapper"
     wrapDelay :: (Ptr VoidPtr -> IO VoidPtr) -> IO (FunPtr (Ptr VoidPtr -> IO VoidPtr))
-
-foreign import ccall "dynamic" 
-    mkIOInt32 :: FunPtr (IO Int32) -> IO Int32
 
 compileVar :: CompileEnv -> Var -> CodeGenFunction VoidPtr (Value VoidPtr)
 compileVar env x = case M.lookup x (symbolValues env) of
