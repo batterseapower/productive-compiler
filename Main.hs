@@ -197,7 +197,6 @@ compile env s (App e x) k = compile env s e $ \s closure_ptr -> do
     fun_ptr_ptr <- bitcast closure_ptr :: CodeGenFunction VoidPtr (Value (Ptr (Ptr (VoidPtr -> VoidPtr -> IO VoidPtr))))
     fun_ptr <- load fun_ptr_ptr
     
-    -- TODO: do I need to mark this as a tail call?
     call fun_ptr closure_ptr arg_ptr >>= k s
 compile env s (Case e alts) k = compile env s e $ \s data_ptr -> do
     -- Retrieve the tag:
@@ -269,7 +268,10 @@ compile env s (Delay e) k = do
             field_ptr <- getElementPtr block_ptr (offset, ())
             fmap ((,) x) $ load field_ptr
     
-    -- We transfer control to the function pointer stored in the global with this name
+    -- We transfer control to the function pointer stored in this global
+    -- I tried to use named globals to link the later module to the earlier one,
+    -- but LLVM's JIT didn't seem to like it: it couldn't link the name in the later
+    -- module to the previously-defined one. I have no idea why. This is the workaround.
     trampoline_global_ptr_ref <- liftIO $ newIORef $ error "compile(Delay): IORef not filled"
     
     -- Create Haskell trampoline that will be invoked when we first need to compile this
@@ -279,7 +281,6 @@ compile env s (Delay e) k = do
         fixup_func <- simpleFunction' $ do
             s <- return $ CS { linkDemands = [] }
             (s, replacement_func_value) <- tunnelIO1 (createFunction InternalLinkage) $ \(block_ptr :: Value (Ptr VoidPtr)) -> do
-                -- FIXME: in the future I may need a different CompileState here
                 value_ptrs <- mapM ($ block_ptr) get_block_value_ptrs
                 compile (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
             
