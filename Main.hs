@@ -2,7 +2,7 @@
 {-# OPTIONS_GHC -Wall -fno-warn-name-shadowing #-}
 module Main (main) where
 
-import Control.Arrow (first)
+import Control.Arrow (second)
 import Control.Monad
 import Control.Monad.IO.Class
 
@@ -14,7 +14,6 @@ import Data.IORef
 import qualified Data.Map as M
 import qualified Data.Set as S
 
-import System.Directory (doesFileExist)
 import System.IO (fixIO)
 
 import Foreign.Ptr
@@ -96,35 +95,36 @@ main :: IO ()
 main = do
     initializeNativeTarget
     
-    (fun, linked_fun_ptrs, link) <- simpleFunction' $ do
-        ((get_linkable_fun_ptrs, link), fun) <- fmap (first prepareLinkDemands) $ compileTop (CE { symbolValues = M.empty }) (CS { linkDemands = [] }) test_term
-        return (liftM3 (,,) (generateFunction fun) get_linkable_fun_ptrs (return link))
-    
-    -- We must fixup links before we run the actual compiled code, or Delays may read some empty IORefs
-    link linked_fun_ptrs
+    -- Compile and link
+    fun <- simpleFunction' $ fmap (second generateFunction) $ compileTop (CE { symbolValues = M.empty }) (CS { linkDemands = [] }) test_term
     
     -- Run the compiled code
     putStrLn "Here we go:"
     fun >>= print
 
 
-simpleFunction' :: CodeGenModule (EngineAccess b) -> IO b
+simpleFunction' :: CodeGenModule (CompileState, EngineAccess b) -> IO b
 simpleFunction' bld = do
     m <- newModule
-    (act, mappings) <- defineModule m (liftM2 (,) bld getGlobalMappings)
+    (act, link, mappings) <- defineModule m $ do
+        (s, act) <- bld
+        let (get_linkable_fun_ptrs, link) = prepareLinkDemands s
+        fmap ((,,) (liftM2 (,) get_linkable_fun_ptrs act) link) getGlobalMappings
     
-    -- Write code:
-    let go n = do
-            let fp = "output." ++ show n ++ ".bc"
-            bad <- doesFileExist fp
-            if bad then go (n + 1) else writeBitcodeToFile fp m
-    go (0 :: Integer)
+    --writeBitcodeToFile "/tmp/debug.bc" m
     
     prov <- createModuleProviderForExistingModule m
-    runEngineAccess $ do
+    (linked_fun_ptrs, res) <- runEngineAccess $ do
         addModuleProvider prov
         addGlobalMappings mappings
         act
+    
+    link linked_fun_ptrs
+    return res
+
+prepareLinkDemands :: CompileState -> (EngineAccess [Ptr LinkableType], [Ptr LinkableType] -> IO ())
+prepareLinkDemands s = (mapM (fmap castFunPtrToPtr . getPointerToFunction) linkable_funs, sequence_ . zipWith ($) store_linkable_ptr_refs)
+  where (linkable_funs, store_linkable_ptr_refs) = unzip (linkDemands s)
 
 
 -- We use this type to represent values in our system that are *either*
@@ -142,10 +142,6 @@ type LinkableType = Ptr (Ptr VoidPtr -> IO VoidPtr) -- Keep the system monotyped
 data CompileState = CS {
     linkDemands :: [(Global LinkableType, Ptr LinkableType -> IO ())]
   }
-
-prepareLinkDemands :: CompileState -> (EngineAccess [Ptr LinkableType], [Ptr LinkableType] -> IO ())
-prepareLinkDemands s = (mapM (fmap castFunPtrToPtr . getPointerToFunction) linkable_funs, sequence_ . zipWith ($) store_linkable_ptr_refs)
-  where (linkable_funs, store_linkable_ptr_refs) = unzip (linkDemands s)
 
 
 compileTop :: CompileEnv -> CompileState -> Term -> CodeGenModule (CompileState, Function (IO Int32))
@@ -280,27 +276,20 @@ compile env s (Delay e) k = do
     reenter_compiler_ptr <- liftIO $ fixIO $ \reenter_compiler_ptr -> wrapDelay $ \block_ptr -> do
         -- Build a Module containing the replacement code and fixup code that transfers
         -- control to the replacement code right now
-        (fixup_func, linked_fun_ptrs, link) <- simpleFunction' $ do
+        fixup_func <- simpleFunction' $ do
             s <- return $ CS { linkDemands = [] }
             (s, replacement_func_value) <- tunnelIO1 (createFunction InternalLinkage) $ \(block_ptr :: Value (Ptr VoidPtr)) -> do
                 -- FIXME: in the future I may need a different CompileState here
                 value_ptrs <- mapM ($ block_ptr) get_block_value_ptrs
                 compile (CE { symbolValues = M.fromList value_ptrs }) s e (\s value_ptr -> fmap (const s) (ret value_ptr))
             
-            let (get_linkable_fun_ptrs, link) = prepareLinkDemands s
-            
             trampoline_global_ptr <- liftIO $ readIORef trampoline_global_ptr_ref
-            fixup_func <- createFunction InternalLinkage $ \block_ptr -> do
+            fmap ((,) s . generateFunction) $ createFunction InternalLinkage $ \block_ptr -> do
                 -- Make sure that next time we execute this Delay we jump right to the replacement
                 trampoline_global <- staticGlobal False trampoline_global_ptr :: CodeGenFunction VoidPtr (Global (Ptr (Ptr VoidPtr -> IO VoidPtr)))
                 store replacement_func_value trampoline_global
                 -- Call the replacement code right now to get the work done
                 call replacement_func_value block_ptr >>= ret
-            
-            return $ liftM3 (,,) (generateFunction fixup_func) get_linkable_fun_ptrs (return link)
-        
-        -- Once again, make sure that we resolve links generated by Delay before we enter the code
-        link linked_fun_ptrs
         
         -- Do the fixup
         freeHaskellFunPtr reenter_compiler_ptr -- TODO: I probably shouldn't free this function while it is still running!
