@@ -157,44 +157,33 @@ compileTop env s e = do
         value <- call fun >>= ptrtoint :: CodeGenFunction Int32 (Value Int32)
         ret value :: CodeGenFunction Int32 Terminate
 
+tunnelIOCore :: (MonadIO m, MonadIO n)
+             => ((c -> m ()) -> n b)
+             -> n (c, b)
+tunnelIOCore control = do
+    -- Urgh, have to resort to tunneling through IORef to get the new State out
+    s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
+    fun <- control $ liftIO . writeIORef s_ref
+    s <- liftIO $ readIORef s_ref
+    return (s, fun)
+
 tunnelIO :: (MonadIO m, MonadIO n)
          => (m () -> n b)
          -> m c
          -> n (c, b)
-tunnelIO control arg = do
-    -- Urgh, have to resort to tunneling through IORef to get the new State out
-    s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
-    fun <- control $ do
-        s <- arg
-        liftIO $ writeIORef s_ref s
-    s <- liftIO $ readIORef s_ref
-    return (s, fun)
+tunnelIO control arg = tunnelIOCore (\c2m -> control $ arg >>= c2m)
 
 tunnelIO1 :: (MonadIO m, MonadIO n)
           => ((arg1 -> m ()) -> n b)
           -> (arg1 -> m c)
           -> n (c, b)
-tunnelIO1 control arg = do
-    -- Urgh, have to resort to tunneling through IORef to get the new State out
-    s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
-    fun <- control $ \arg1 -> do
-        s <- arg arg1
-        liftIO $ writeIORef s_ref s
-    s <- liftIO $ readIORef s_ref
-    return (s, fun)
+tunnelIO1 control arg = tunnelIOCore (\c2m -> control $ \arg1 -> arg arg1 >>= c2m)
 
 tunnelIO2 :: (MonadIO m, MonadIO n)
           => ((arg1 -> arg2 -> m ()) -> n b)
           -> (arg1 -> arg2 -> m c)
           -> n (c, b)
-tunnelIO2 control arg = do
-    -- Urgh, have to resort to tunneling through IORef to get the new State out
-    s_ref <- liftIO $ newIORef (error "tunnelIO: unfilled IORef")
-    fun <- control $ \arg1 arg2 -> do
-        s <- arg arg1 arg2
-        liftIO $ writeIORef s_ref s
-    s <- liftIO $ readIORef s_ref
-    return (s, fun)
+tunnelIO2 control arg = tunnelIOCore (\c2m -> control $ \arg1 arg2 -> arg arg1 arg2 >>= c2m)
 
 compile :: CompileEnv -> CompileState -> Term
         -> (CompileState -> Value VoidPtr -> CodeGenFunction VoidPtr r)
