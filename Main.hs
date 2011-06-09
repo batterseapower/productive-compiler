@@ -395,15 +395,6 @@ termFreeVars worst_fvs e = term e
 restrict :: Ord k => M.Map k v -> S.Set k -> M.Map k v
 restrict m s = M.filterWithKey (\x _ -> x `S.member` s) m
 
-{-
-mapAccumLM :: (Monad m) => (acc -> x -> m (acc, y)) -> acc -> [x] -> m (acc, [y])
-mapAccumLM _ s []     = return (s, [])
-mapAccumLM f s (x:xs) = do
-     (s', y)  <- f s x
-     (s'',ys) <- mapAccumLM f s' xs
-     return (s'',y:ys)
--}
-
 accumLM :: (Monad m) => acc -> [acc -> m (acc, y)] -> m (acc, [y])
 accumLM s []     = return (s, [])
 accumLM s (f:fs) = do
