@@ -107,7 +107,7 @@ main = do
         fmap generateFunction $ createFunction InternalLinkage $ do
             --poker <- staticFunction poke_func_ptr :: CodeGenFunction Int32 (Function (IO Int32))
             --x <- call poker
-            global <- staticGlobal global_ptr :: CodeGenFunction Int32 (Global Int32)
+            global <- staticGlobal False (castFunPtrToPtr global_ptr) :: CodeGenFunction Int32 (Global Int32)
             x <- load global
             ret x
     
